@@ -300,25 +300,10 @@ app.on('open-url', (event, url) => {
 
 // --- Window -------------------------------------------------------------------
 
-function attachAuthInterceptors(contents, opts = {}) {
-  const { isMain = false } = opts;
-
-  if (isMain) {
-    // Main window: only intercept OAuth URLs (Google/Apple) to open in the
-    // system browser. Everything else — including iframes, embedded players,
-    // and any other navigation — is allowed normally.
-    const interceptOAuth = (event, url) => {
-      if (shouldOpenExternal(url)) {
-        event.preventDefault();
-        openExternalAuthUrl(url);
-      }
-    };
-    contents.on('will-navigate', interceptOAuth);
-    contents.on('will-redirect', interceptOAuth);
-  }
-
-  // Block ALL new tabs/popups. If it's an OAuth URL, send it to the system
-  // browser instead. Otherwise just deny silently.
+function attachAuthInterceptors(contents) {
+  // Do not touch normal navigation, redirects, iframes, or the main webContents.
+  // Only block brand-new tabs/popups. OAuth popups are sent to the system
+  // browser so Google/Apple login can continue outside the app.
   contents.setWindowOpenHandler(({ url }) => {
     if (shouldOpenExternal(url)) {
       openExternalAuthUrl(url);
@@ -349,7 +334,7 @@ function createWindow() {
     },
   });
 
-  attachAuthInterceptors(win.webContents, { isMain: true });
+  attachAuthInterceptors(win.webContents);
 
   // Cancel any download attempts immediately.
   win.webContents.session.on('will-download', (event, item) => {
@@ -386,18 +371,6 @@ app.whenReady().then(() => {
 });
 
 app.on('window-all-closed', () => app.quit());
-
-// Close any popup webContents that slips past setWindowOpenHandler.
-// (iframes are part of the main webContents and are NOT affected here.)
-app.on('web-contents-created', (_e, contents) => {
-  if (contents !== win?.webContents) {
-    try { contents.close(); } catch {
-      try { contents.destroy(); } catch {}
-    }
-    return;
-  }
-  contents.on('devtools-opened', () => { try { contents.closeDevTools(); } catch {} });
-});
 
 ipcMain.handle('win:minimize', () => win?.minimize());
 ipcMain.handle('win:close', () => win?.close());
