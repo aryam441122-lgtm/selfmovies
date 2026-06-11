@@ -132,7 +132,7 @@ function extractAuthPayload(urlOrPayload) {
 function buildCallbackUrl(payload) {
   if (!payload) return APP_URL;
   const safePayload = payload.replace(/^\?/, '').replace(/^#/, '');
-  return `${APP_URL}${ELECTRON_CALLBACK_PATH}?${safePayload}#${safePayload}`;
+  return `${APP_URL}${ELECTRON_CALLBACK_PATH}#${safePayload}`;
 }
 
 function decodeJwtPayload(token) {
@@ -236,8 +236,14 @@ async function handleDeepLink(deepLink) {
     const raw = extractAuthPayload(deepLink);
     pendingAuthPayload = raw || pendingAuthPayload;
     const payload = raw || pendingAuthPayload;
-    const wroteSession = await writeSessionToWebview(payload);
-    await loadAppUrl(wroteSession ? APP_URL : buildCallbackUrl(payload));
+    if (payload) {
+      // Let the website's own Electron callback call auth.setSession().
+      // Manually writing localStorage can return "true" while still missing
+      // internal auth metadata, which lands the user on / without a session.
+      await loadAppUrl(buildCallbackUrl(payload));
+    } else {
+      await loadAppUrl(APP_URL);
+    }
     if (win.isMinimized()) win.restore();
     win.focus();
   } catch {
