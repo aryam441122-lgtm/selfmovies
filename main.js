@@ -5,18 +5,22 @@
 //      or a redirect chain that starts with https://selfy.lovable.app/~oauth/initiate
 //   2. We intercept ALL of those (navigation, redirects, popups) and open the
 //      final URL in the user's default browser (Chrome/Edge/…).
-//   3. The site redirects back to selfmovies://auth#<tokens> after consent.
-//   4. Windows fires our protocol handler -> we forward the hash to
+//   3. The site redirects back to selfmovies://auth?<tokens> after consent.
+//   4. Windows fires our protocol handler -> we forward the payload to
 //      https://selfy.lovable.app/auth/electron-callback so the site can call
 //      supabase.auth.setSession() and the user ends up logged in inside the app.
 
 const { app, BrowserWindow, ipcMain, session, shell } = require('electron');
+const http = require('http');
 const path = require('path');
 
 const APP_URL = 'https://selfy.lovable.app';
 const ALLOWED_ORIGIN = new URL(APP_URL).origin;
 const PROTOCOL = 'selfmovies';
 const ELECTRON_CALLBACK_PATH = '/auth/electron-callback';
+const SUPABASE_URL = 'https://akmldmfvyutcjrcwvhgf.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFrbWxkbWZ2eXV0Y2pyY3d2aGdmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYwNzQ1MzQsImV4cCI6MjA5MTY1MDUzNH0.vm0jXHIQTlUTi6NpWdU8aU7L6l_2tN_L-YxitcBRFSw';
+const SUPABASE_STORAGE_KEY = 'sb-akmldmfvyutcjrcwvhgf-auth-token';
 
 // Same-origin paths that START an OAuth flow — must be opened in the system browser
 const APP_OAUTH_PATH_PATTERNS = [
@@ -56,6 +60,17 @@ function shouldOpenExternal(url) {
   return isAppOAuthPath(url) || isProviderAuthUrl(url);
 }
 
+async function openExternalAuthUrl(url) {
+  let target = url;
+  const u = parseUrl(url);
+  if (u && u.origin === ALLOWED_ORIGIN && APP_OAUTH_PATH_PATTERNS.some((re) => re.test(u.pathname))) {
+    const callbackUrl = await startLocalAuthServer();
+    u.searchParams.set('redirect_uri', callbackUrl);
+    target = u.toString();
+  }
+  shell.openExternal(target);
+}
+
 // --- Single instance + protocol -----------------------------------------------
 
 const gotLock = app.requestSingleInstanceLock();
@@ -72,23 +87,131 @@ if (!gotLock) {
 }
 
 let win = null;
+let pendingAuthPayload = '';
+let localAuthServer = null;
+let localAuthCallbackUrl = '';
+
+function startLocalAuthServer() {
+  return new Promise((resolve) => {
+    if (localAuthCallbackUrl) return resolve(localAuthCallbackUrl);
+
+    localAuthServer = http.createServer((req, res) => {
+      const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
+
+      const finish = (html) => {
+        res.writeHead(200, {
+          'Content-Type': 'text/html; charset=utf-8',
+          'Cache-Control': 'no-store',
+          'Access-Control-Allow-Origin': '*',
+        });
+        res.end(html);
+      };
+
+      if (requestUrl.pathname === '/capture') {
+        const payload = requestUrl.search.slice(1);
+        if (payload) handleDeepLink(`${PROTOCOL}://auth?${payload}`);
+        return finish('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;background:#090909;color:#fff;display:grid;place-items:center;height:100vh"><h2>تم تسجيل الدخول، ارجع للتطبيق.</h2><script>window.close()</script></body>');
+      }
+
+      if (requestUrl.pathname !== '/auth/electron-callback') {
+        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
+        return res.end('Not found');
+      }
+
+      const queryPayload = requestUrl.search.slice(1);
+      if (queryPayload) handleDeepLink(`${PROTOCOL}://auth?${queryPayload}`);
+
+      return finish(`<!doctype html>
+<html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>Self Movies</title></head>
+<body style="margin:0;font-family:Arial,sans-serif;background:#090909;color:#fff;display:grid;place-items:center;height:100vh;text-align:center">
+  <main><h2>جاري إكمال تسجيل الدخول...</h2><p>يمكنك إغلاق هذه النافذة بعد الرجوع للتطبيق.</p></main>
+  <script>
+    (async function(){
+      var payload = (location.hash && location.hash.slice(1)) || (location.search && location.search.slice(1)) || '';
+      if (payload) {
+        try { await fetch('/capture?' + payload, { cache: 'no-store' }); } catch (e) {}
+        try { location.href = '${PROTOCOL}://auth?' + payload; } catch (e) {}
+      }
+      setTimeout(function(){ window.close(); }, 1200);
+    })();
+  </script>
+</body></html>`);
+    });
+
+    localAuthServer.listen(0, '127.0.0.1', () => {
+      const address = localAuthServer.address();
+      const port = typeof address === 'object' && address ? address.port : 0;
+      localAuthCallbackUrl = `http://127.0.0.1:${port}/auth/electron-callback`;
+      resolve(localAuthCallbackUrl);
+    });
+
+    localAuthServer.on('error', () => {
+      localAuthCallbackUrl = `${APP_URL}${ELECTRON_CALLBACK_PATH}`;
+      resolve(localAuthCallbackUrl);
+    });
+  });
+}
 
 function findDeepLink(argv) {
-  return (argv || []).find((a) => typeof a === 'string' && a.startsWith(`${PROTOCOL}://`));
+  for (const arg of argv || []) {
+    if (typeof arg !== 'string') continue;
+    const match = arg.match(new RegExp(`${PROTOCOL}:\\/\\/[^\"'\\s]+`, 'i'));
+    if (match) return match[0];
+  }
+  return null;
+}
+
+function cleanPayload(raw) {
+  if (!raw) return '';
+  let payload = String(raw).trim();
+  for (let i = 0; i < 3; i += 1) {
+    if (payload.startsWith('?') || payload.startsWith('#')) payload = payload.slice(1);
+    try {
+      const decoded = decodeURIComponent(payload);
+      if (decoded === payload) break;
+      payload = decoded;
+    } catch {
+      break;
+    }
+  }
+  return payload.replace(/^\?/, '').replace(/^#/, '');
+}
+
+function extractAuthPayload(urlOrPayload) {
+  const u = parseUrl(urlOrPayload);
+  if (!u) {
+    const direct = cleanPayload(urlOrPayload);
+    return direct;
+  }
+
+  const candidates = [u.search.slice(1), u.hash.slice(1)];
+  for (const key of ['url', 'returnUrl', 'redirect_to', 'redirect_uri', 'next']) {
+    const value = u.searchParams.get(key) || u.hash && new URLSearchParams(u.hash.slice(1)).get(key);
+    if (value) candidates.push(value);
+  }
+
+  for (const candidate of candidates) {
+    const payload = cleanPayload(candidate);
+    if (/(^|&)(access_token|refresh_token|code|error)=/i.test(payload)) return payload;
+  }
+  return cleanPayload(urlOrPayload);
+}
+
+function buildCallbackUrl(payload) {
+  if (!payload) return `${APP_URL}${ELECTRON_CALLBACK_PATH}?electron=1`;
+  const safePayload = payload.replace(/^\?/, '').replace(/^#/, '');
+  // Send the same payload in BOTH query and hash. The current website callback
+  // reads the hash, while this keeps a recoverable copy if a browser/protocol
+  // handler strips the fragment during the hand-off.
+  return `${APP_URL}${ELECTRON_CALLBACK_PATH}?${safePayload}#${safePayload}`;
 }
 
 function handleDeepLink(deepLink) {
   if (!deepLink || !win || win.isDestroyed()) return;
   try {
-    const u = new URL(deepLink);
-    // Windows strips the URL fragment from custom-protocol launches, so the
-    // site MUST send tokens in the query string (?access_token=...).
-    // We then forward them as a HASH to /auth/electron-callback because
-    // supabase-js reads tokens from window.location.hash.
-    const raw = (u.search ? u.search.slice(1) : '') || (u.hash ? u.hash.slice(1) : '');
-    const target = raw
-      ? `${APP_URL}${ELECTRON_CALLBACK_PATH}#${raw}`
-      : `${APP_URL}${ELECTRON_CALLBACK_PATH}`;
+    const raw = extractAuthPayload(deepLink);
+    pendingAuthPayload = raw || pendingAuthPayload;
+    const target = buildCallbackUrl(raw || pendingAuthPayload);
     win.loadURL(target);
     if (win.isMinimized()) win.restore();
     win.focus();
@@ -120,7 +243,7 @@ function attachAuthInterceptors(contents, opts = {}) {
   const intercept = (event, url) => {
     if (shouldOpenExternal(url)) {
       event.preventDefault();
-      shell.openExternal(url);
+      openExternalAuthUrl(url);
       // For the main window, stay on the current page (don't navigate away)
       return true;
     }
@@ -146,7 +269,7 @@ function attachAuthInterceptors(contents, opts = {}) {
 
   contents.setWindowOpenHandler(({ url }) => {
     if (shouldOpenExternal(url)) {
-      shell.openExternal(url);
+      openExternalAuthUrl(url);
       return { action: 'deny' };
     }
     if (isAppOrigin(url)) {
