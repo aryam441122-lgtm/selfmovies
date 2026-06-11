@@ -81,7 +81,14 @@ function handleDeepLink(deepLink) {
   if (!deepLink || !win || win.isDestroyed()) return;
   try {
     const u = new URL(deepLink);
-    const target = `${APP_URL}${ELECTRON_CALLBACK_PATH}${u.search || ''}${u.hash || ''}`;
+    // Windows strips the URL fragment from custom-protocol launches, so the
+    // site MUST send tokens in the query string (?access_token=...).
+    // We then forward them as a HASH to /auth/electron-callback because
+    // supabase-js reads tokens from window.location.hash.
+    const raw = (u.search ? u.search.slice(1) : '') || (u.hash ? u.hash.slice(1) : '');
+    const target = raw
+      ? `${APP_URL}${ELECTRON_CALLBACK_PATH}#${raw}`
+      : `${APP_URL}${ELECTRON_CALLBACK_PATH}`;
     win.loadURL(target);
     if (win.isMinimized()) win.restore();
     win.focus();
