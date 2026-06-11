@@ -6,7 +6,7 @@
 //   2. We intercept ALL of those (navigation, redirects, popups) and open the
 //      final URL in the user's default browser (Chrome/Edge/…).
 //   3. The site redirects back to selfmovies://auth?<tokens> after consent.
-//   4. Windows fires our protocol handler -> we write the Supabase session into
+//   4. Windows fires our protocol handler -> we write the auth session into
 //      the app webview storage, then reload the site already signed in.
 
 const { app, BrowserWindow, ipcMain, session, shell } = require('electron');
@@ -19,6 +19,7 @@ const ELECTRON_CALLBACK_PATH = '/auth/electron-callback';
 const SUPABASE_URL = 'https://akmldmfvyutcjrcwvhgf.supabase.co';
 const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImFrbWxkbWZ2eXV0Y2pyY3d2aGdmIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYwNzQ1MzQsImV4cCI6MjA5MTY1MDUzNH0.vm0jXHIQTlUTi6NpWdU8aU7L6l_2tN_L-YxitcBRFSw';
 const SUPABASE_STORAGE_KEY = 'sb-akmldmfvyutcjrcwvhgf-auth-token';
+const ALLOWED_AUTH_PROVIDERS = new Set(['google', 'apple']);
 
 // Same-origin paths that START an OAuth flow — must be opened in the system browser
 const APP_OAUTH_PATH_PATTERNS = [
@@ -27,7 +28,7 @@ const APP_OAUTH_PATH_PATTERNS = [
   /^\/auth\/oauth/i,
 ];
 
-// External provider hosts — also open in the system browser
+// External auth hosts — only the supported login flow may leave the app.
 const AUTH_HOST_PATTERNS = [
   /(^|\.)accounts\.google\.com$/i,
   /(^|\.)accounts\.youtube\.com$/i,
@@ -35,27 +36,37 @@ const AUTH_HOST_PATTERNS = [
   /(^|\.)appleid\.apple\.com$/i,
   /(^|\.)icloud\.com$/i,
   /(^|\.)idmsa\.apple\.com$/i,
-  /(^|\.)login\.microsoftonline\.com$/i,
-  /(^|\.)live\.com$/i,
-  /(^|\.)facebook\.com$/i,
-  /(^|\.)github\.com$/i,
-  /(^|\.)supabase\.co$/i,
-  /(^|\.)supabase\.in$/i,
 ];
 
 function parseUrl(u) { try { return new URL(u); } catch { return null; } }
 function isAppOrigin(url) { const u = parseUrl(url); return !!u && u.origin === ALLOWED_ORIGIN; }
+function getProvider(url) {
+  const u = parseUrl(url);
+  return (u?.searchParams.get('provider') || u?.searchParams.get('provider_id') || '').toLowerCase();
+}
+function isAllowedAuthProvider(url) {
+  const provider = getProvider(url);
+  return provider ? ALLOWED_AUTH_PROVIDERS.has(provider) : true;
+}
 function isAppOAuthPath(url) {
   const u = parseUrl(url);
   if (!u || u.origin !== ALLOWED_ORIGIN) return false;
-  return APP_OAUTH_PATH_PATTERNS.some((re) => re.test(u.pathname));
+  return APP_OAUTH_PATH_PATTERNS.some((re) => re.test(u.pathname)) && isAllowedAuthProvider(url);
+}
+function isLovableOAuthBrokerUrl(url) {
+  const u = parseUrl(url);
+  return !!u && /(^|\.)oauth\.lovable\.app$/i.test(u.hostname) && /^\/initiate/i.test(u.pathname) && isAllowedAuthProvider(url);
+}
+function isSupabaseOAuthAuthorizeUrl(url) {
+  const u = parseUrl(url);
+  return !!u && u.origin === new URL(SUPABASE_URL).origin && /^\/auth\/v1\/authorize/i.test(u.pathname) && isAllowedAuthProvider(url);
 }
 function isProviderAuthUrl(url) {
   const u = parseUrl(url);
   return !!u && AUTH_HOST_PATTERNS.some((re) => re.test(u.hostname));
 }
 function shouldOpenExternal(url) {
-  return isAppOAuthPath(url) || isProviderAuthUrl(url);
+  return isAppOAuthPath(url) || isLovableOAuthBrokerUrl(url) || isSupabaseOAuthAuthorizeUrl(url) || isProviderAuthUrl(url);
 }
 
 async function openExternalAuthUrl(url) {
@@ -135,6 +146,21 @@ function buildCallbackUrl(payload) {
   return `${APP_URL}${ELECTRON_CALLBACK_PATH}#${safePayload}`;
 }
 
+async function fetchUserForSession(accessToken) {
+  try {
+    const response = await fetch(`${SUPABASE_URL}/auth/v1/user`, {
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${accessToken}`,
+      },
+    });
+    if (!response.ok) return null;
+    return await response.json();
+  } catch {
+    return null;
+  }
+}
+
 function decodeJwtPayload(token) {
   try {
     const part = String(token || '').split('.')[1];
@@ -209,6 +235,9 @@ async function writeSessionToWebview(payload) {
   const authSession = sessionFromPayload(payload);
   if (!authSession || !win || win.isDestroyed()) return false;
 
+  const user = await fetchUserForSession(authSession.access_token);
+  if (user && user.id) authSession.user = user;
+
   if (!isAppOrigin(win.webContents.getURL())) await loadAppUrl(APP_URL);
 
   const storedValue = JSON.stringify(authSession);
@@ -237,10 +266,13 @@ async function handleDeepLink(deepLink) {
     pendingAuthPayload = raw || pendingAuthPayload;
     const payload = raw || pendingAuthPayload;
     if (payload) {
-      // Let the website's own Electron callback call auth.setSession().
-      // Manually writing localStorage can return "true" while still missing
-      // internal auth metadata, which lands the user on / without a session.
-      await loadAppUrl(buildCallbackUrl(payload));
+      const stored = await writeSessionToWebview(payload);
+      if (stored) {
+        pendingAuthPayload = '';
+        await loadAppUrl(APP_URL);
+      } else {
+        await loadAppUrl(buildCallbackUrl(payload));
+      }
     } else {
       await loadAppUrl(APP_URL);
     }
@@ -271,6 +303,14 @@ app.on('open-url', (event, url) => {
 function attachAuthInterceptors(contents, opts = {}) {
   const { isMain = false } = opts;
 
+  const blockOffOrigin = (event) => {
+    event.preventDefault();
+    if (!isMain) {
+      try { contents.close(); } catch {}
+    }
+    return true;
+  };
+
   const intercept = (event, url) => {
     if (shouldOpenExternal(url)) {
       event.preventDefault();
@@ -283,19 +323,12 @@ function attachAuthInterceptors(contents, opts = {}) {
 
   contents.on('will-navigate', (e, url) => {
     if (intercept(e, url)) return;
-    // For non-main webContents (popups), block everything off-origin to the system browser
-    if (!isMain && !isAppOrigin(url)) {
-      e.preventDefault();
-      shell.openExternal(url);
-    }
+    if (!isAppOrigin(url)) blockOffOrigin(e);
   });
 
   contents.on('will-redirect', (e, url) => {
     if (intercept(e, url)) return;
-    if (!isMain && !isAppOrigin(url)) {
-      e.preventDefault();
-      shell.openExternal(url);
-    }
+    if (!isAppOrigin(url)) blockOffOrigin(e);
   });
 
   contents.setWindowOpenHandler(({ url }) => {
@@ -307,7 +340,6 @@ function attachAuthInterceptors(contents, opts = {}) {
       try { win && win.loadURL(url); } catch {}
       return { action: 'deny' };
     }
-    shell.openExternal(url);
     return { action: 'deny' };
   });
 }
