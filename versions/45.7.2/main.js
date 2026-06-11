@@ -6,12 +6,10 @@
 //   2. We intercept ALL of those (navigation, redirects, popups) and open the
 //      final URL in the user's default browser (Chrome/Edge/…).
 //   3. The site redirects back to selfmovies://auth?<tokens> after consent.
-//   4. Windows fires our protocol handler -> we forward the payload to
-//      https://selfy.lovable.app/auth/electron-callback so the site can call
-//      supabase.auth.setSession() and the user ends up logged in inside the app.
+//   4. Windows fires our protocol handler -> we write the Supabase session into
+//      the app webview storage, then reload the site already signed in.
 
 const { app, BrowserWindow, ipcMain, session, shell } = require('electron');
-const http = require('http');
 const path = require('path');
 
 const APP_URL = 'https://selfy.lovable.app';
@@ -85,69 +83,6 @@ if (!gotLock) {
 
 let win = null;
 let pendingAuthPayload = '';
-let localAuthServer = null;
-let localAuthCallbackUrl = '';
-
-function startLocalAuthServer() {
-  return new Promise((resolve) => {
-    if (localAuthCallbackUrl) return resolve(localAuthCallbackUrl);
-
-    localAuthServer = http.createServer((req, res) => {
-      const requestUrl = new URL(req.url || '/', 'http://127.0.0.1');
-
-      const finish = (html) => {
-        res.writeHead(200, {
-          'Content-Type': 'text/html; charset=utf-8',
-          'Cache-Control': 'no-store',
-          'Access-Control-Allow-Origin': '*',
-        });
-        res.end(html);
-      };
-
-      if (requestUrl.pathname === '/capture') {
-        const payload = requestUrl.search.slice(1);
-        if (payload) handleDeepLink(`${PROTOCOL}://auth?${payload}`);
-        return finish('<!doctype html><meta charset="utf-8"><body style="font-family:sans-serif;background:#090909;color:#fff;display:grid;place-items:center;height:100vh"><h2>تم تسجيل الدخول، ارجع للتطبيق.</h2><script>window.close()</script></body>');
-      }
-
-      if (requestUrl.pathname !== '/auth/electron-callback') {
-        res.writeHead(404, { 'Content-Type': 'text/plain; charset=utf-8' });
-        return res.end('Not found');
-      }
-
-      const queryPayload = requestUrl.search.slice(1);
-      if (queryPayload) handleDeepLink(`${PROTOCOL}://auth?${queryPayload}`);
-
-      return finish(`<!doctype html>
-<html lang="ar" dir="rtl"><head><meta charset="utf-8"><title>Self Movies</title></head>
-<body style="margin:0;font-family:Arial,sans-serif;background:#090909;color:#fff;display:grid;place-items:center;height:100vh;text-align:center">
-  <main><h2>جاري إكمال تسجيل الدخول...</h2><p>يمكنك إغلاق هذه النافذة بعد الرجوع للتطبيق.</p></main>
-  <script>
-    (async function(){
-      var payload = (location.hash && location.hash.slice(1)) || (location.search && location.search.slice(1)) || '';
-      if (payload) {
-        try { await fetch('/capture?' + payload, { cache: 'no-store' }); } catch (e) {}
-        try { location.href = '${PROTOCOL}://auth?' + payload; } catch (e) {}
-      }
-      setTimeout(function(){ window.close(); }, 1200);
-    })();
-  </script>
-</body></html>`);
-    });
-
-    localAuthServer.listen(0, '127.0.0.1', () => {
-      const address = localAuthServer.address();
-      const port = typeof address === 'object' && address ? address.port : 0;
-      localAuthCallbackUrl = `http://127.0.0.1:${port}/auth/electron-callback`;
-      resolve(localAuthCallbackUrl);
-    });
-
-    localAuthServer.on('error', () => {
-      localAuthCallbackUrl = `${APP_URL}${ELECTRON_CALLBACK_PATH}`;
-      resolve(localAuthCallbackUrl);
-    });
-  });
-}
 
 function findDeepLink(argv) {
   for (const arg of argv || []) {
@@ -197,21 +132,112 @@ function extractAuthPayload(urlOrPayload) {
 function buildCallbackUrl(payload) {
   if (!payload) return APP_URL;
   const safePayload = payload.replace(/^\?/, '').replace(/^#/, '');
-  // Load the site's home page with the auth payload as a URL hash.
-  // Supabase's auth client (detectSessionInUrl) reads the hash on any page
-  // load and calls setSession() automatically. We intentionally avoid
-  // /auth/electron-callback because that page is designed to redirect back
-  // out to selfmovies://, which would create an infinite loop inside Electron.
-  return `${APP_URL}/#${safePayload}`;
+  return `${APP_URL}${ELECTRON_CALLBACK_PATH}?${safePayload}#${safePayload}`;
 }
 
-function handleDeepLink(deepLink) {
+function decodeJwtPayload(token) {
+  try {
+    const part = String(token || '').split('.')[1];
+    if (!part) return null;
+    const normalized = part.replace(/-/g, '+').replace(/_/g, '/');
+    const padded = normalized.padEnd(normalized.length + ((4 - normalized.length % 4) % 4), '=');
+    return JSON.parse(Buffer.from(padded, 'base64').toString('utf8'));
+  } catch {
+    return null;
+  }
+}
+
+function sessionFromPayload(payload) {
+  const params = new URLSearchParams(cleanPayload(payload));
+  const accessToken = params.get('access_token') || '';
+  const refreshToken = params.get('refresh_token') || '';
+  if (!accessToken || !refreshToken) return null;
+
+  const claims = decodeJwtPayload(accessToken) || {};
+  const expiresIn = Number(params.get('expires_in')) || Math.max(60, Number(claims.exp || 0) - Math.floor(Date.now() / 1000)) || 3600;
+  const expiresAt = Number(params.get('expires_at')) || Number(claims.exp) || Math.floor(Date.now() / 1000) + expiresIn;
+
+  return {
+    access_token: accessToken,
+    token_type: params.get('token_type') || 'bearer',
+    expires_in: expiresIn,
+    expires_at: expiresAt,
+    refresh_token: refreshToken,
+    provider_token: params.get('provider_token') || null,
+    provider_refresh_token: params.get('provider_refresh_token') || null,
+    user: {
+      id: claims.sub || '',
+      aud: claims.aud || 'authenticated',
+      role: claims.role || 'authenticated',
+      email: claims.email || '',
+      email_confirmed_at: claims.email ? new Date((claims.iat || Date.now() / 1000) * 1000).toISOString() : null,
+      phone: claims.phone || '',
+      confirmed_at: new Date((claims.iat || Date.now() / 1000) * 1000).toISOString(),
+      last_sign_in_at: new Date().toISOString(),
+      app_metadata: claims.app_metadata || {},
+      user_metadata: claims.user_metadata || {},
+      identities: [],
+      created_at: new Date((claims.iat || Date.now() / 1000) * 1000).toISOString(),
+      updated_at: new Date().toISOString(),
+      is_anonymous: false,
+    },
+  };
+}
+
+function loadAppUrl(url) {
+  return new Promise((resolve) => {
+    if (!win || win.isDestroyed()) return resolve(false);
+    let done = false;
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      win.webContents.removeListener('did-finish-load', onFinish);
+      win.webContents.removeListener('did-fail-load', onFail);
+      resolve(ok);
+    };
+    const onFinish = () => finish(true);
+    const onFail = () => finish(false);
+    const timer = setTimeout(() => finish(false), 10000);
+    win.webContents.once('did-finish-load', onFinish);
+    win.webContents.once('did-fail-load', onFail);
+    win.loadURL(url).catch(() => finish(false));
+  });
+}
+
+async function writeSessionToWebview(payload) {
+  const authSession = sessionFromPayload(payload);
+  if (!authSession || !win || win.isDestroyed()) return false;
+
+  if (!isAppOrigin(win.webContents.getURL())) await loadAppUrl(APP_URL);
+
+  const storedValue = JSON.stringify(authSession);
+  const script = `(() => {
+    const key = ${JSON.stringify(SUPABASE_STORAGE_KEY)};
+    const value = ${JSON.stringify(storedValue)};
+    localStorage.setItem(key, value);
+    sessionStorage.setItem('selfmovies:last-auth-sync', String(Date.now()));
+    window.dispatchEvent(new Event('selfmovies-auth-sync'));
+    return localStorage.getItem(key) === value;
+  })()`;
+
+  try {
+    const ok = await win.webContents.executeJavaScript(script, true);
+    return ok === true;
+  } catch {
+    await loadAppUrl(APP_URL);
+    try { return await win.webContents.executeJavaScript(script, true) === true; } catch { return false; }
+  }
+}
+
+async function handleDeepLink(deepLink) {
   if (!deepLink || !win || win.isDestroyed()) return;
   try {
     const raw = extractAuthPayload(deepLink);
     pendingAuthPayload = raw || pendingAuthPayload;
-    const target = buildCallbackUrl(raw || pendingAuthPayload);
-    win.loadURL(target);
+    const payload = raw || pendingAuthPayload;
+    const wroteSession = await writeSessionToWebview(payload);
+    await loadAppUrl(wroteSession ? APP_URL : buildCallbackUrl(payload));
     if (win.isMinimized()) win.restore();
     win.focus();
   } catch {
