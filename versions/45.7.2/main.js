@@ -303,42 +303,25 @@ app.on('open-url', (event, url) => {
 function attachAuthInterceptors(contents, opts = {}) {
   const { isMain = false } = opts;
 
-  const blockOffOrigin = (event) => {
-    event.preventDefault();
-    if (!isMain) {
-      try { contents.close(); } catch {}
-    }
-    return true;
-  };
+  if (isMain) {
+    // Main window: only intercept OAuth URLs (Google/Apple) to open in the
+    // system browser. Everything else — including iframes, embedded players,
+    // and any other navigation — is allowed normally.
+    const interceptOAuth = (event, url) => {
+      if (shouldOpenExternal(url)) {
+        event.preventDefault();
+        openExternalAuthUrl(url);
+      }
+    };
+    contents.on('will-navigate', interceptOAuth);
+    contents.on('will-redirect', interceptOAuth);
+  }
 
-  const intercept = (event, url) => {
-    if (shouldOpenExternal(url)) {
-      event.preventDefault();
-      openExternalAuthUrl(url);
-      // For the main window, stay on the current page (don't navigate away)
-      return true;
-    }
-    return false;
-  };
-
-  contents.on('will-navigate', (e, url) => {
-    if (intercept(e, url)) return;
-    if (!isAppOrigin(url)) blockOffOrigin(e);
-  });
-
-  contents.on('will-redirect', (e, url) => {
-    if (intercept(e, url)) return;
-    if (!isAppOrigin(url)) blockOffOrigin(e);
-  });
-
+  // Block ALL new tabs/popups. If it's an OAuth URL, send it to the system
+  // browser instead. Otherwise just deny silently.
   contents.setWindowOpenHandler(({ url }) => {
     if (shouldOpenExternal(url)) {
       openExternalAuthUrl(url);
-      return { action: 'deny' };
-    }
-    if (isAppOrigin(url)) {
-      try { win && win.loadURL(url); } catch {}
-      return { action: 'deny' };
     }
     return { action: 'deny' };
   });
@@ -367,6 +350,12 @@ function createWindow() {
   });
 
   attachAuthInterceptors(win.webContents, { isMain: true });
+
+  // Cancel any download attempts immediately.
+  win.webContents.session.on('will-download', (event, item) => {
+    event.preventDefault();
+    try { item.cancel(); } catch {}
+  });
 
   // Block devtools / inspect
   win.webContents.on('before-input-event', (event, input) => {
@@ -398,10 +387,14 @@ app.whenReady().then(() => {
 
 app.on('window-all-closed', () => app.quit());
 
-// Catch any popup that still gets created — apply the same interceptors
+// Close any popup webContents that slips past setWindowOpenHandler.
+// (iframes are part of the main webContents and are NOT affected here.)
 app.on('web-contents-created', (_e, contents) => {
   if (contents !== win?.webContents) {
-    attachAuthInterceptors(contents, { isMain: false });
+    try { contents.close(); } catch {
+      try { contents.destroy(); } catch {}
+    }
+    return;
   }
   contents.on('devtools-opened', () => { try { contents.closeDevTools(); } catch {} });
 });
