@@ -61,14 +61,11 @@ function shouldOpenExternal(url) {
 }
 
 async function openExternalAuthUrl(url) {
-  let target = url;
-  const u = parseUrl(url);
-  if (u && u.origin === ALLOWED_ORIGIN && APP_OAUTH_PATH_PATTERNS.some((re) => re.test(u.pathname))) {
-    const callbackUrl = await startLocalAuthServer();
-    u.searchParams.set('redirect_uri', callbackUrl);
-    target = u.toString();
-  }
-  shell.openExternal(target);
+  // The Lovable OAuth broker has a strict allow-list for redirect_uri,
+  // so we MUST NOT override it. Just open the URL as-is in the system
+  // browser. The site's /auth/electron-callback page handles the rest by
+  // redirecting to selfmovies://auth#<tokens>.
+  shell.openExternal(url);
 }
 
 // --- Single instance + protocol -----------------------------------------------
@@ -198,12 +195,14 @@ function extractAuthPayload(urlOrPayload) {
 }
 
 function buildCallbackUrl(payload) {
-  if (!payload) return `${APP_URL}${ELECTRON_CALLBACK_PATH}?electron=1`;
+  if (!payload) return APP_URL;
   const safePayload = payload.replace(/^\?/, '').replace(/^#/, '');
-  // Send the same payload in BOTH query and hash. The current website callback
-  // reads the hash, while this keeps a recoverable copy if a browser/protocol
-  // handler strips the fragment during the hand-off.
-  return `${APP_URL}${ELECTRON_CALLBACK_PATH}?${safePayload}#${safePayload}`;
+  // Load the site's home page with the auth payload as a URL hash.
+  // Supabase's auth client (detectSessionInUrl) reads the hash on any page
+  // load and calls setSession() automatically. We intentionally avoid
+  // /auth/electron-callback because that page is designed to redirect back
+  // out to selfmovies://, which would create an infinite loop inside Electron.
+  return `${APP_URL}/#${safePayload}`;
 }
 
 function handleDeepLink(deepLink) {
