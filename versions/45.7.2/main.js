@@ -1,16 +1,14 @@
 // Self Movies — Electron shell for https://selfy.lovable.app
 //
-// Auth flow (new):
-//   1. User clicks "Sign in with Google/Apple" inside the app.
-//   2. We intercept the OAuth URL and open it in the user's DEFAULT browser
-//      (Chrome/Edge/etc.) using shell.openExternal — so their existing
-//      Google sessions are visible and the flow is familiar.
-//   3. The website is configured to redirect back to:  selfmovies://auth#<tokens>
-//   4. Windows fires our registered protocol handler -> Electron receives the
-//      deep link, parses the Supabase tokens, and hands them to the app via
-//      a one-time URL: https://selfy.lovable.app/auth/electron-callback#<tokens>
-//   5. The site reads the hash, calls supabase.auth.setSession(), and the
-//      user is logged in inside the desktop app.
+// OAuth flow:
+//   1. Site triggers OAuth — either window.open(authUrl), window.location = authUrl,
+//      or a redirect chain that starts with https://selfy.lovable.app/~oauth/initiate
+//   2. We intercept ALL of those (navigation, redirects, popups) and open the
+//      final URL in the user's default browser (Chrome/Edge/…).
+//   3. The site redirects back to selfmovies://auth#<tokens> after consent.
+//   4. Windows fires our protocol handler -> we forward the hash to
+//      https://selfy.lovable.app/auth/electron-callback so the site can call
+//      supabase.auth.setSession() and the user ends up logged in inside the app.
 
 const { app, BrowserWindow, ipcMain, session, shell } = require('electron');
 const path = require('path');
@@ -18,10 +16,16 @@ const path = require('path');
 const APP_URL = 'https://selfy.lovable.app';
 const ALLOWED_ORIGIN = new URL(APP_URL).origin;
 const PROTOCOL = 'selfmovies';
-// Path the website should redirect to after OAuth (we read tokens from the hash)
 const ELECTRON_CALLBACK_PATH = '/auth/electron-callback';
 
-// Hosts that mean "this is an OAuth / provider login page" — open in external browser
+// Same-origin paths that START an OAuth flow — must be opened in the system browser
+const APP_OAUTH_PATH_PATTERNS = [
+  /^\/~oauth\//i,           // Lovable Cloud managed OAuth broker
+  /^\/auth\/v1\/authorize/i,
+  /^\/auth\/oauth/i,
+];
+
+// External provider hosts — also open in the system browser
 const AUTH_HOST_PATTERNS = [
   /(^|\.)accounts\.google\.com$/i,
   /(^|\.)accounts\.youtube\.com$/i,
@@ -33,27 +37,31 @@ const AUTH_HOST_PATTERNS = [
   /(^|\.)live\.com$/i,
   /(^|\.)facebook\.com$/i,
   /(^|\.)github\.com$/i,
+  /(^|\.)supabase\.co$/i,
+  /(^|\.)supabase\.in$/i,
 ];
 
-function isAuthUrl(url) {
-  try {
-    const u = new URL(url);
-    return AUTH_HOST_PATTERNS.some((re) => re.test(u.hostname));
-  } catch {
-    return false;
-  }
+function parseUrl(u) { try { return new URL(u); } catch { return null; } }
+function isAppOrigin(url) { const u = parseUrl(url); return !!u && u.origin === ALLOWED_ORIGIN; }
+function isAppOAuthPath(url) {
+  const u = parseUrl(url);
+  if (!u || u.origin !== ALLOWED_ORIGIN) return false;
+  return APP_OAUTH_PATH_PATTERNS.some((re) => re.test(u.pathname));
 }
-function isAppOrigin(url) {
-  try { return new URL(url).origin === ALLOWED_ORIGIN; } catch { return false; }
+function isProviderAuthUrl(url) {
+  const u = parseUrl(url);
+  return !!u && AUTH_HOST_PATTERNS.some((re) => re.test(u.hostname));
+}
+function shouldOpenExternal(url) {
+  return isAppOAuthPath(url) || isProviderAuthUrl(url);
 }
 
-// --- Single instance + protocol registration ---------------------------------
+// --- Single instance + protocol -----------------------------------------------
 
 const gotLock = app.requestSingleInstanceLock();
 if (!gotLock) {
   app.quit();
 } else {
-  // Register selfmovies:// as our custom protocol on Windows/Linux
   if (process.defaultApp) {
     if (process.argv.length >= 2) {
       app.setAsDefaultProtocolClient(PROTOCOL, process.execPath, [path.resolve(process.argv[1])]);
@@ -69,27 +77,20 @@ function findDeepLink(argv) {
   return (argv || []).find((a) => typeof a === 'string' && a.startsWith(`${PROTOCOL}://`));
 }
 
-// Hand off a selfmovies:// callback to the website so it can finish the login
 function handleDeepLink(deepLink) {
   if (!deepLink || !win || win.isDestroyed()) return;
   try {
-    // selfmovies://auth#access_token=...&refresh_token=...
-    // Forward the hash to the site's /auth/electron-callback page.
     const u = new URL(deepLink);
-    const hash = u.hash || '';
-    const search = u.search || '';
-    const target = `${APP_URL}${ELECTRON_CALLBACK_PATH}${search}${hash}`;
+    const target = `${APP_URL}${ELECTRON_CALLBACK_PATH}${u.search || ''}${u.hash || ''}`;
     win.loadURL(target);
     if (win.isMinimized()) win.restore();
     win.focus();
-  } catch (e) {
-    // Fallback: just reload the home page
+  } catch {
     try { win.loadURL(APP_URL); } catch {}
   }
 }
 
-// Windows: second instance carries the deep link in argv
-app.on('second-instance', (_event, argv) => {
+app.on('second-instance', (_e, argv) => {
   const link = findDeepLink(argv);
   if (link) handleDeepLink(link);
   if (win && !win.isDestroyed()) {
@@ -98,14 +99,57 @@ app.on('second-instance', (_event, argv) => {
   }
 });
 
-// macOS: deep link arrives via open-url
 app.on('open-url', (event, url) => {
   event.preventDefault();
   if (win) handleDeepLink(url);
   else app.once('browser-window-created', () => setTimeout(() => handleDeepLink(url), 300));
 });
 
-// --- Main window -------------------------------------------------------------
+// --- Window -------------------------------------------------------------------
+
+function attachAuthInterceptors(contents, opts = {}) {
+  const { isMain = false } = opts;
+
+  const intercept = (event, url) => {
+    if (shouldOpenExternal(url)) {
+      event.preventDefault();
+      shell.openExternal(url);
+      // For the main window, stay on the current page (don't navigate away)
+      return true;
+    }
+    return false;
+  };
+
+  contents.on('will-navigate', (e, url) => {
+    if (intercept(e, url)) return;
+    // For non-main webContents (popups), block everything off-origin to the system browser
+    if (!isMain && !isAppOrigin(url)) {
+      e.preventDefault();
+      shell.openExternal(url);
+    }
+  });
+
+  contents.on('will-redirect', (e, url) => {
+    if (intercept(e, url)) return;
+    if (!isMain && !isAppOrigin(url)) {
+      e.preventDefault();
+      shell.openExternal(url);
+    }
+  });
+
+  contents.setWindowOpenHandler(({ url }) => {
+    if (shouldOpenExternal(url)) {
+      shell.openExternal(url);
+      return { action: 'deny' };
+    }
+    if (isAppOrigin(url)) {
+      try { win && win.loadURL(url); } catch {}
+      return { action: 'deny' };
+    }
+    shell.openExternal(url);
+    return { action: 'deny' };
+  });
+}
 
 function createWindow() {
   win = new BrowserWindow({
@@ -129,30 +173,9 @@ function createWindow() {
     },
   });
 
-  // Intercept navigations to OAuth providers and send them to the system browser
-  win.webContents.on('will-navigate', (e, url) => {
-    if (isAppOrigin(url)) return;
-    if (isAuthUrl(url)) {
-      e.preventDefault();
-      shell.openExternal(url);
-      return;
-    }
-    e.preventDefault();
-    shell.openExternal(url);
-  });
+  attachAuthInterceptors(win.webContents, { isMain: true });
 
-  // window.open(...) — block popups and send the URL to the system browser instead
-  win.webContents.setWindowOpenHandler(({ url }) => {
-    if (isAppOrigin(url)) {
-      // Same site: just navigate the main window
-      try { win.loadURL(url); } catch {}
-      return { action: 'deny' };
-    }
-    shell.openExternal(url);
-    return { action: 'deny' };
-  });
-
-  // Block DevTools / inspection
+  // Block devtools / inspect
   win.webContents.on('before-input-event', (event, input) => {
     const k = (input.key || '').toLowerCase();
     if (k === 'f12') return event.preventDefault();
@@ -169,7 +192,6 @@ function createWindow() {
 
 app.whenReady().then(() => {
   const ses = session.fromPartition('persist:selfmovies');
-  // Identify as plain Chrome so the site can serve the normal layout
   const ua = ses.getUserAgent()
     .replace(/\sElectron\/[\d.]+/g, '')
     .replace(/\sSelf Movies\/[\d.]+/g, '');
@@ -177,14 +199,17 @@ app.whenReady().then(() => {
 
   createWindow();
 
-  // If the app was launched directly via a deep link (Windows cold start)
   const initialLink = findDeepLink(process.argv);
   if (initialLink) setTimeout(() => handleDeepLink(initialLink), 500);
 });
 
 app.on('window-all-closed', () => app.quit());
 
+// Catch any popup that still gets created — apply the same interceptors
 app.on('web-contents-created', (_e, contents) => {
+  if (contents !== win?.webContents) {
+    attachAuthInterceptors(contents, { isMain: false });
+  }
   contents.on('devtools-opened', () => { try { contents.closeDevTools(); } catch {} });
 });
 
