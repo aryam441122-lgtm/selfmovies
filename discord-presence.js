@@ -24,6 +24,7 @@ RPC.register(CLIENT_ID);
 
 function buildActivity() {
   return {
+    type: 3, // WATCHING
     details: 'أفلام ومسلسلات مجاناً',
     state: 'بدون إعلانات',
     startTimestamp: startTimestamp || new Date(),
