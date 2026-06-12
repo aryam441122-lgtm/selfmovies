@@ -3,7 +3,14 @@
 // Make sure an Art Asset named exactly "selfmovies" is uploaded under
 // Rich Presence → Art Assets in the Discord Developer Portal.
 
-const RPC = require('discord-rpc');
+let RPC;
+try {
+  RPC = require('discord-rpc');
+} catch (err) {
+  console.warn('[discord-rpc] not installed — Rich Presence disabled.');
+  module.exports = { startDiscordPresence: () => {}, stopDiscordPresence: () => {} };
+  return;
+}
 
 const CLIENT_ID = '1302405087112597594';
 const LARGE_IMAGE_KEY = 'selfmovies';
