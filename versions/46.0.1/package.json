@@ -1,0 +1,31 @@
+{
+  "name": "self-movies",
+  "version": "46.0.1",
+  "description": "Self Movies — أفلام ومسلسلات مجانية بدون إعلانات",
+  "main": "main.js",
+  "author": "Self Movies",
+  "scripts": {
+    "start": "electron .",
+    "build:win": "electron-builder --win"
+  },
+  "devDependencies": {
+    "electron": "^31.0.0",
+    "electron-builder": "^24.13.3"
+  },
+  "dependencies": {
+    "discord-rpc": "^4.0.1"
+  },
+  "build": {
+    "appId": "com.selfmovies.app",
+    "productName": "Self Movies",
+    "directories": { "output": "release" },
+    "files": ["main.js", "preload.js", "discord-presence.js", "node_modules/**/*"],
+    "asar": true,
+    "compression": "maximum",
+    "win": {
+      "icon": "assets/icon.ico",
+      "target": [{ "target": "nsis", "arch": ["x64"] }],
+      "artifactName": "Self Movies-${version}.${ext}"
+    }
+  }
+}
