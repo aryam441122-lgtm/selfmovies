@@ -11,7 +11,21 @@
 
 const { app, BrowserWindow, ipcMain, session, shell } = require('electron');
 const path = require('path');
-const { startDiscordPresence, stopDiscordPresence } = require('./discord-presence');
+
+// Discord Rich Presence is optional — if the module or its dependency
+// (discord-rpc) is missing from the packaged app, fall back to no-ops so
+// the app still launches instead of crashing on startup.
+let startDiscordPresence = () => {};
+let stopDiscordPresence = () => {};
+try {
+  const presence = require('./discord-presence');
+  if (presence && typeof presence.startDiscordPresence === 'function') {
+    startDiscordPresence = presence.startDiscordPresence;
+    stopDiscordPresence = presence.stopDiscordPresence || stopDiscordPresence;
+  }
+} catch (err) {
+  console.warn('[discord-presence] disabled:', err?.message || err);
+}
 
 const APP_URL = 'https://selfy.lovable.app';
 const ALLOWED_ORIGIN = new URL(APP_URL).origin;
